@@ -1,18 +1,21 @@
-"""Sparse keyword index — the baseline every dense retriever must beat."""
+"""Split passages into retrieval-sized chunks.
+
+Chunk size is a real lever on RAG quality: too big and retrieval is imprecise,
+too small and you lose context. config.yaml controls it.
+"""
 from __future__ import annotations
 
-from rank_bm25 import BM25Okapi
+from src.config import CONFIG
 
 
-class BM25Index:
-    def __init__(self, chunks: list[dict]):
-        self.chunks = chunks
-        # Simple whitespace tokenization is a fine starting point; you can improve
-        # it later (lowercasing, stopwords) and measure whether it actually helps.
-        self.tokenized = [c["text"].lower().split() for c in chunks]
-        self.bm25 = BM25Okapi(self.tokenized)
+def chunk_passages(corpus: list[dict]) -> list[dict]:
+    """Split each passage into overlapping chunks.
 
-    def search(self, query: str, top_k: int) -> list[tuple[dict, float]]:
-        scores = self.bm25.get_scores(query.lower().split())
-        ranked = sorted(zip(self.chunks, scores), key=lambda x: x[1], reverse=True)
-        return ranked[:top_k]
+    TODO:
+      - Use a token-aware splitter (e.g. langchain RecursiveCharacterTextSplitter
+        with a tokenizer, or tiktoken) sized by CONFIG.data['chunk_size'] /
+        ['chunk_overlap'].
+      - Keep passage_id on each chunk so you can trace a chunk back to its source.
+    Returns: list of {"chunk_id": str, "passage_id": str, "text": str}
+    """
+    raise NotImplementedError
