@@ -1,30 +1,41 @@
-"""CLI: load a dataset, build the corpus, chunk it, and build both indexes.
-Run this once before querying.
+"""Assembles the nodes into a LangGraph state machine.
 
-Usage: python scripts/build_index.py --dataset natural_questions --sample 5000
+The conditional edge `_should_continue` is what turns a linear pipeline into an agent:
+after grading, it either loops back (rewrite -> retrieve) to gather more evidence, or
+moves on to generate. MAX_ITER (from config) is the safety valve against infinite loops.
 """
-import argparse
-from src.data.loaders import load_dataset_normalized
-from src.data.preprocess import build_corpus
-from src.indexing.chunking import chunk_passages
-from src.indexing.vector_index import VectorIndex
+from __future__ import annotations
+
+from functools import partial
+from langgraph.graph import StateGraph, END
+
+from src.config import CONFIG
+from src.agent.state import AgentState
+from src.agent import nodes
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", default="natural_questions")
-    ap.add_argument("--sample", type=int, default=None)
-    args = ap.parse_args()
-
-    records = load_dataset_normalized(args.dataset, args.sample)
-    corpus = build_corpus(records)
-    chunks = chunk_passages(corpus)
-
-    vidx = VectorIndex()
-    vidx.build(chunks)
-    print(f"Indexed {len(chunks)} chunks from {len(records)} records.")
-    # TODO: also persist the BM25 index (pickle chunks) so run_query can reload it.
+def _should_continue(state: AgentState) -> str:
+    if state.get("sufficient"):
+        return "generate"
+    if state.get("iterations", 0) >= CONFIG.agent["max_iterations"]:
+        return "generate"          # give up gracefully, answer with what we have
+    return "rewrite"               # insufficient + budget left -> try again
 
 
-if __name__ == "__main__":
-    main()
+def build_agent(llm, retriever):
+    """retriever: callable (query, k) -> list[dict]. Returns a compiled agent."""
+    g = StateGraph(AgentState)
+    g.add_node("decompose", partial(nodes.decompose, llm=llm))
+    g.add_node("retrieve", partial(nodes.retrieve, retriever=retriever))
+    g.add_node("grade", partial(nodes.grade, llm=llm))
+    g.add_node("rewrite", partial(nodes.rewrite, llm=llm))
+    g.add_node("generate", partial(nodes.generate, llm=llm))
+
+    g.set_entry_point("decompose")
+    g.add_edge("decompose", "retrieve")
+    g.add_edge("retrieve", "grade")
+    g.add_conditional_edges("grade", _should_continue,
+                            {"rewrite": "rewrite", "generate": "generate"})
+    g.add_edge("rewrite", "retrieve")     # the loop
+    g.add_edge("generate", END)
+    return g.compile()

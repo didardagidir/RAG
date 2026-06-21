@@ -1,55 +1,28 @@
-"""LLM factory + resilient invocation.
+# All tunable knobs in one place. Loaded by src/config.py.
 
-get_llm() returns a provider-agnostic LangChain chat model (default: Gemini Flash-Lite
-on the free tier). safe_invoke() wraps every LLM call with rate-limit handling — the
-free tier has tight per-day/per-minute quotas, so production-grade code degrades
-gracefully on 429 instead of crashing.
-"""
-from __future__ import annotations
+data:
+  dataset: natural_questions      # natural_questions | hotpot_qa
+  sample_size: 5000               # null = use full set
+  chunk_size: 512                 # tokens per chunk
+  chunk_overlap: 64
 
-import os
-import time
-from src.config import CONFIG, ENV
+retrieval:
+  top_k: 20                       # candidates pulled before reranking
+  final_k: 5                      # passages handed to the generator
+  use_hybrid: true                # BM25 + dense fusion
+  use_reranker: true
+  reranker_model: cross-encoder/ms-marco-MiniLM-L-6-v2
+  rrf_k: 60                       # reciprocal rank fusion constant
 
+agent:
+  enable_multihop: true
+  max_iterations: 1               # narrow corpus: extra loops just burn quota; raise for fullwiki
+  max_subquestions: 4
 
-def get_llm():
-    """Build the chat model from env config. Swap providers by changing .env only."""
-    provider = ENV.llm_provider
-    if provider == "gemini":
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        # .env (via ENV) first; fall back to a process env var (e.g. Colab userdata)
-        key = ENV.gemini_api_key or os.environ.get("GEMINI_API_KEY")
-        return ChatGoogleGenerativeAI(
-            model=ENV.llm_model,
-            google_api_key=key,
-            temperature=CONFIG.generation["temperature"],
-        )
-    if provider == "openai":
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(model=ENV.llm_model,
-                          temperature=CONFIG.generation["temperature"])
-    if provider == "anthropic":
-        from langchain_anthropic import ChatAnthropic
-        return ChatAnthropic(model=ENV.llm_model,
-                             temperature=CONFIG.generation["temperature"])
-    raise ValueError(f"Unknown LLM_PROVIDER: {provider}")
+generation:
+  temperature: 0.0
+  max_tokens: 512
 
-
-def safe_invoke(llm, prompt: str, max_retries: int = 4) -> str:
-    """Invoke the LLM, retrying with backoff on rate-limit (429) errors.
-
-    Free-tier quotas are tight; this prevents a single 429 from killing a long
-    evaluation run. Non-rate-limit errors are re-raised immediately.
-    """
-    for attempt in range(max_retries):
-        try:
-            return llm.invoke(prompt).content.strip()
-        except Exception as e:
-            msg = str(e)
-            if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-                wait = 20 * (attempt + 1)
-                print(f"  ⏳ rate limit — waiting {wait}s ({attempt+1}/{max_retries})")
-                time.sleep(wait)
-            else:
-                raise
-    raise RuntimeError("Rate limit: retries exhausted")
+evaluation:
+  metrics: [recall@10, mrr@10, ndcg@10, faithfulness, answer_relevance]
+  n_samples: 200

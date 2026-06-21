@@ -1,21 +1,18 @@
-"""Split passages into retrieval-sized chunks.
+# LLM provider — Gemini's free tier needs no credit card (get a key at aistudio.google.com)
+LLM_PROVIDER=gemini
+LLM_MODEL=gemini-2.5-flash-lite
+GEMINI_API_KEY=
 
-Chunk size is a real lever on RAG quality: too big and retrieval is imprecise,
-too small and you lose context. config.yaml controls it.
-"""
-from __future__ import annotations
+# Other providers (uncomment one and set its key to switch — no other code changes):
+# LLM_PROVIDER=openai
+# LLM_MODEL=gpt-4o-mini
+# OPENAI_API_KEY=
+# LLM_PROVIDER=anthropic
+# LLM_MODEL=claude-haiku-4-5
+# ANTHROPIC_API_KEY=
 
-from src.config import CONFIG
+# Embedding model (HuggingFace id, runs locally via sentence-transformers)
+EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
 
-
-def chunk_passages(corpus: list[dict]) -> list[dict]:
-    """Split each passage into overlapping chunks.
-
-    TODO:
-      - Use a token-aware splitter (e.g. langchain RecursiveCharacterTextSplitter
-        with a tokenizer, or tiktoken) sized by CONFIG.data['chunk_size'] /
-        ['chunk_overlap'].
-      - Keep passage_id on each chunk so you can trace a chunk back to its source.
-    Returns: list of {"chunk_id": str, "passage_id": str, "text": str}
-    """
-    raise NotImplementedError
+# Where the vector store / data lives
+VECTOR_STORE_DIR=./data

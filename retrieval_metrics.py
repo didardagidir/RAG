@@ -1,58 +1,82 @@
-"""Prompts for each reasoning node. Kept here (not inline) because prompt quality is
-a big part of agent quality — these were iterated against real failures:
-  - DECOMPOSE: tightened with a rule + few-shot examples to stop over-decomposition
-    (it was splitting simple single-topic questions into 4 sub-questions).
-  - GRADE: reframed from "is this exhaustive?" to "can the question be answered?" —
-    the original was too strict and caused unnecessary retrieval loops.
-  - GENERATE: strict grounding ("ONLY the passages") to prevent hallucination.
+"""The reasoning nodes. Each takes the agent state, does its work via the LLM and/or
+retriever, and returns only the state fields it changed.
+
+All LLM calls go through safe_invoke() for rate-limit resilience. decompose() skips the
+LLM entirely on obviously-simple questions (a zero-cost heuristic) to conserve quota.
 """
+from __future__ import annotations
 
-DECOMPOSE = """You decide whether a question needs to be broken into sub-questions, \
-and if so, break it into the MINIMAL set.
+import json
+import re
 
-RULE: Only decompose if answering requires finding separate facts in sequence — for \
-example, identifying one entity and then asking something about that entity ("Who \
-founded the company that acquired X?" -> find the company, then its founder).
+from src.config import CONFIG
+from src.llm import safe_invoke
+from src.agent import prompts
+from src.agent.state import AgentState
 
-If the question is about a SINGLE topic — even a broad one — return it UNCHANGED as a \
-single-item list. Do NOT split a topic into aspects or sub-themes.
+# multi-hop markers: if NONE are present we treat the question as simple and skip
+# the decompose LLM call. Conservative by design — a stray marker just costs one call,
+# whereas wrongly calling a multi-hop question "simple" would lose decomposition.
+_MULTIHOP = [r"\bthat\b", r"\bwhich\b", r"\bwhose\b", r"who .*\bof\b",
+             r"founded .*(company|by)", r"acquired"]
 
-Examples:
-- "How did orchestras change in the Romantic period?" -> ["How did orchestras change in the Romantic period?"]
-- "Who founded the company that acquired DeepMind?" -> ["What company acquired DeepMind?", "Who founded that company?"]
 
-Question: {question}
+def _looks_simple(q: str) -> bool:
+    return not any(re.search(p, q.lower()) for p in _MULTIHOP)
 
-Return ONLY a JSON list of strings, nothing else."""
 
-GRADE = """You judge whether the question can be ANSWERED from the retrieved passages. \
-The passages do NOT need to cover the topic exhaustively — they only need to contain \
-enough to answer THIS specific question.
+def _parse_json(raw: str, fallback):
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return fallback
 
-Mark "sufficient": true if a correct answer can be derived from the passages, even if \
-they don't cover every aspect of the topic.
-Mark "sufficient": false ONLY if the core information needed is genuinely absent or \
-contradictory.
 
-Question: {question}
+def decompose(state: AgentState, llm) -> AgentState:
+    q = state["question"]
+    if _looks_simple(q):
+        return {"sub_questions": [q]}                      # no LLM call
+    raw = safe_invoke(llm, prompts.DECOMPOSE.format(question=q))
+    subs = _parse_json(raw, [q])
+    subs = subs if isinstance(subs, list) and subs else [q]
+    return {"sub_questions": subs[: CONFIG.agent["max_subquestions"]]}
 
-Passages:
-{passages}
 
-Return ONLY a JSON object: {{"sufficient": true or false, "missing": "what core fact is missing, or null"}}"""
+def retrieve(state: AgentState, retriever) -> AgentState:
+    """retriever is a callable: (query, k) -> list[dict] with chunk_id/passage_id/etc."""
+    existing = {r["chunk_id"]: r for r in state.get("retrieved", [])}
+    k = CONFIG.retrieval["final_k"]
+    for sq in state["sub_questions"]:
+        for r in retriever(sq, k):
+            existing[r["chunk_id"]] = r
+    return {"retrieved": list(existing.values()),
+            "iterations": state.get("iterations", 0) + 1}
 
-REWRITE = """The question '{question}' is missing: {missing}. Write ONE focused search \
-query to find it. Return only the query."""
 
-GENERATE = """Answer the question using ONLY the passages below. Do not use outside \
-knowledge. If the passages don't contain the answer, say exactly: "I cannot answer \
-this from the provided sources."
+def grade(state: AgentState, llm) -> AgentState:
+    passages = "\n\n".join(
+        f"[{i+1}] {r.get('title','')}: {r['text'][:400]}"
+        for i, r in enumerate(state["retrieved"])
+    )
+    raw = safe_invoke(llm, prompts.GRADE.format(question=state["question"], passages=passages))
+    result = _parse_json(raw, {"sufficient": True, "missing": None})  # default: stop the loop
+    return {"sufficient": bool(result.get("sufficient", True)),
+            "missing": result.get("missing")}
 
-Cite the passage numbers you used in square brackets, e.g. [1][3].
 
-Question: {question}
+def rewrite(state: AgentState, llm) -> AgentState:
+    new_q = safe_invoke(llm, prompts.REWRITE.format(
+        question=state["question"], missing=state.get("missing")))
+    return {"sub_questions": [new_q]}
 
-Passages:
-{passages}
 
-Answer:"""
+def generate(state: AgentState, llm) -> AgentState:
+    passages = "\n\n".join(
+        f"[{i+1}] {r.get('title','')}: {r['text']}"
+        for i, r in enumerate(state["retrieved"])
+    )
+    answer = safe_invoke(llm, prompts.GENERATE.format(question=state["question"], passages=passages))
+    sources = [{"n": i+1, "title": r.get("title", ""), "passage_id": r.get("passage_id")}
+               for i, r in enumerate(state["retrieved"])]
+    return {"answer": answer, "sources": sources}
