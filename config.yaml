@@ -1,0 +1,18 @@
+"""Minimal demo UI. Shows the answer, its citations, and — importantly — the agent's
+reasoning trace (sub-questions, iterations). That trace is what makes a RAG demo
+feel agentic rather than a black box."""
+import streamlit as st
+
+st.set_page_config(page_title="Agentic RAG", layout="wide")
+st.title("Agentic RAG — Multi-Hop QA")
+
+# TODO:
+#  - Cache index loading + build_pipeline with @st.cache_resource (load once).
+#  - Text input for the question.
+#  - On submit: pipe.ask(q); show answer, citations, sub_questions, iteration count.
+#  - Optional: show retrieved passages in an expander so reviewers see the evidence.
+
+st.info("Wire this up to src.pipeline.build_pipeline once your indexes are built.")
+question = st.text_input("Ask a question")
+if st.button("Ask") and question:
+    st.warning("Not implemented yet — see TODOs in app/streamlit_app.py")
