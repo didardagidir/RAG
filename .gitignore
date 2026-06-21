@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+data/chroma/
+data/*.parquet
+data/*.json
+.ipynb_checkpoints/
+*.egg-info/
+.pytest_cache/
