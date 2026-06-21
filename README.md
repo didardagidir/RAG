@@ -1,21 +1,216 @@
-"""Split passages into retrieval-sized chunks.
+[README (2).md](https://github.com/user-attachments/files/29178082/README.2.md)
+# Agentic RAG — Multi-Hop Question Answering with Retrieval Benchmarking
 
-Chunk size is a real lever on RAG quality: too big and retrieval is imprecise,
-too small and you lose context. config.yaml controls it.
-"""
-from __future__ import annotations
+An end-to-end **Agentic Retrieval-Augmented Generation** system that answers open-domain
+and multi-hop questions, then *measures* its own retrieval and generation quality against
+standard benchmarks.
 
-from src.config import CONFIG
+This is not a "wrap an LLM and call it RAG" demo. The point is to show the full pipeline —
+keyword baseline → dense retrieval → reranking → agentic multi-hop reasoning → and rigorous
+evaluation — the way it would be built in practice.
 
+---
 
-def chunk_passages(corpus: list[dict]) -> list[dict]:
-    """Split each passage into overlapping chunks.
+## Why this project exists
 
-    TODO:
-      - Use a token-aware splitter (e.g. langchain RecursiveCharacterTextSplitter
-        with a tokenizer, or tiktoken) sized by CONFIG.data['chunk_size'] /
-        ['chunk_overlap'].
-      - Keep passage_id on each chunk so you can trace a chunk back to its source.
-    Returns: list of {"chunk_id": str, "passage_id": str, "text": str}
-    """
-    raise NotImplementedError
+Most RAG demos stop at "it returns an answer." This one is built to answer the harder
+question an interviewer actually asks: **how do you know it's good?**
+
+So every retrieval and generation step is benchmarked, and the agent can decompose a hard
+question into sub-questions, retrieve iteratively, and synthesize an answer across multiple
+documents.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TD
+    Q[User question] --> ROUTE{Agent: simple or multi-hop?}
+    ROUTE -->|simple| R1[Retrieve once]
+    ROUTE -->|multi-hop| DECOMP[Decompose into sub-questions]
+    DECOMP --> R2[Retrieve per sub-question]
+    R1 --> GRADE[Grade relevance of docs]
+    R2 --> GRADE
+    GRADE -->|not enough| REWRITE[Rewrite query / retrieve again]
+    REWRITE --> GRADE
+    GRADE -->|sufficient| GEN[Generate grounded answer]
+    GEN --> CHECK{Faithful to sources?}
+    CHECK -->|no| REWRITE
+    CHECK -->|yes| OUT[Final answer + citations]
+```
+
+### Retrieval stack (each layer is swappable and benchmarked)
+
+| Layer | What it does | Default implementation |
+|-------|--------------|------------------------|
+| Sparse | Keyword baseline | BM25 (`rank_bm25`) |
+| Dense | Semantic retrieval | sentence-transformers + Chroma |
+| Hybrid | Combine sparse + dense | Reciprocal Rank Fusion |
+| Rerank | Reorder top-k | Cross-encoder reranker |
+| Agent | Multi-hop orchestration | LangGraph state machine |
+
+---
+
+## Datasets
+
+| Dataset | Role in the project | Why |
+|---------|---------------------|-----|
+| **Natural Questions** | Primary QA set (single-hop) | Real Google queries, natural full-sentence questions, short + long answers |
+| **HotpotQA** | Multi-hop evaluation | Forces the agent to retrieve and reason across multiple documents |
+| **BEIR** (subset) | Retriever benchmarking | Standardized zero-shot retrieval evaluation across domains |
+
+Datasets are loaded in **BEIR format** (corpus / queries / qrels) — see `src/data/loaders.py`.
+BEIR ships NQ and HotpotQA already segmented into passages with relevance judgments, so gold
+relevant passage ids come for free (no manual labeling).
+
+**Methodology note — working set.** The full corpora are large (NQ 2.68M passages, HotpotQA 5.2M).
+For development and feasible indexing, evaluation runs on a per-dataset **working set**: every gold
+passage for the sampled queries is kept, plus ~5K random distractors. Naive subsampling would
+silently drop gold passages and zero out retrieval scores, so the sampler preserves gold by
+construction. Absolute scores are therefore **optimistic** versus the full corpus — the value is in
+**relative comparison across strategies**, run on identical data. The HotpotQA working set averages
+**exactly 2.0 gold passages per query**, confirming every question genuinely requires combining two
+documents (vs ~1.0 for single-hop NQ).
+
+---
+
+## Evaluation
+
+Two components are evaluated separately, because a RAG system can fail at either:
+
+**Retrieval quality** (`src/evaluation/retrieval_metrics.py`)
+- `Recall@k` — did we retrieve the relevant document at all?
+- `MRR@10` — how high did the relevant document rank?
+- `NDCG@10` — ranking quality with graded relevance
+
+**Generation quality** (`src/evaluation/generation_metrics.py`)
+- Faithfulness — is the answer grounded in retrieved context (no hallucination)?
+- Answer relevance — does it actually address the question?
+- (Implemented via RAGAS / LLM-as-judge)
+
+---
+
+## Tech stack
+
+- **Python 3.11**
+- **LangChain + LangGraph** — agent orchestration and the multi-hop state machine
+- **sentence-transformers** — embeddings + cross-encoder reranking
+- **Chroma** — vector store (swappable for FAISS / Qdrant)
+- **rank_bm25** — sparse baseline
+- **RAGAS** — generation-side evaluation
+- **Streamlit** — interactive demo
+- **pydantic-settings + YAML** — typed configuration
+
+LLM provider is configurable (OpenAI / Anthropic / local) via `.env`.
+
+---
+
+## Project structure
+
+```
+agentic-rag/
+├── config/config.yaml         # All tunable parameters in one place
+├── src/
+│   ├── data/                  # Dataset loaders + preprocessing
+│   ├── indexing/              # Chunking, BM25 index, vector index
+│   ├── retrieval/             # BM25 / dense / hybrid / reranker
+│   ├── agent/                 # LangGraph: state, nodes, graph, prompts
+│   ├── generation/            # Grounded answer generation
+│   ├── evaluation/            # Retrieval + generation metrics
+│   └── pipeline.py            # Wires everything together
+├── scripts/                   # CLI: build index, run query, evaluate
+├── app/streamlit_app.py       # Demo UI
+├── notebooks/                 # EDA + experiment notebooks
+└── tests/
+```
+
+---
+
+## Quickstart
+
+```bash
+# 1. Setup
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env          # then add your LLM API key
+
+# 2. Build the index (downloads + indexes the corpus)
+python scripts/build_index.py --dataset natural_questions --sample 5000
+
+# 3. Ask a question
+python scripts/run_query.py --question "Who founded the company that acquired DeepMind?"
+
+# 4. Run evaluation
+python scripts/evaluate.py --dataset hotpot_qa --n 200
+
+# 5. Launch the demo
+streamlit run app/streamlit_app.py
+```
+
+---
+
+## Roadmap / build order
+
+This is also the suggested order to *implement* the project. Each phase is self-contained
+and produces something demonstrable.
+
+- [x] **Phase 1 — Data & indexing.** Load NQ (BEIR format), build a gold-preserving 5K working set, chunk documents (data-driven: only 1.4% of passages exceed 256 words).
+- [x] **Phase 2 — Basic RAG.** Dense retrieval (bge-small) + exact cosine search. Baseline: Recall@10 0.949.
+- [x] **Phase 3 — Hybrid + rerank.** RRF fusion + cross-encoder reranking. MRR 0.889 → 0.965.
+- [x] **Phase 4 — Agentic layer.** LangGraph state machine: query decomposition, answerability grading, and a self-correcting rewrite→retrieve loop. Grounded generation refuses to answer when the corpus lacks the facts (no hallucination). Rate-limit-resilient (`safe_invoke`) for free-tier LLMs.
+- [~] **Phase 5 — Multi-hop.** HotpotQA loaded (avg 2 gold/query); agent validated on chained questions. Quantitative agentic-vs-single-shot comparison pending (Phase 6).
+- [ ] **Phase 6 — Evaluation harness.** Retrieval metrics + RAGAS. Produce a results table.
+- [ ] **Phase 7 — Demo + writeup.** Streamlit app + a short report on what improved and why.
+
+> Tip: commit at the end of each phase with a clear message. The git history itself becomes
+> evidence of how you reason through a system.
+
+---
+
+## Results
+
+Retrieval evaluation on the 5K-passage NQ working set, 200 queries. Each row adds one
+pipeline stage; the point is the *delta* each stage contributes.
+
+| Configuration | Recall@10 | MRR@10 | NDCG@10 |
+|---------------|-----------|--------|---------|
+| BM25 (sparse baseline) | 0.867 | 0.782 | 0.786 |
+| Dense (bge-small-en-v1.5) | 0.949 | 0.889 | 0.895 |
+| Hybrid (RRF fusion) | 0.969 | 0.901 | 0.907 |
+| **Hybrid + cross-encoder rerank** | **0.978** | **0.965** | **0.959** |
+
+**What the numbers say:**
+- **BM25 underperforms on NQ** — natural-language questions reward semantic matching over keyword
+  overlap. Still, it finds gold for 87% of queries.
+- **Hybrid recovers ~40% of dense's remaining error** (Recall 0.949 → 0.969). BM25 and dense make
+  *different* mistakes; RRF fuses their ranks (not raw scores — sidestepping incompatible scales).
+- **Reranking is the largest jump in ranking quality** (MRR 0.901 → 0.965). The cross-encoder scores
+  query–passage pairs jointly, pushing the gold passage to rank ~1 almost every time.
+
+### Agentic layer (Phase 4) — qualitative findings
+
+The LangGraph agent (decompose → retrieve → grade → rewrite-loop → generate) was validated on both
+corpora:
+
+- **Grounded honesty:** when the corpus lacks the facts, the agent returns *"I cannot answer this
+  from the provided sources"* rather than hallucinating — even for questions whose answer it plausibly
+  knows from pretraining (e.g. Google's founders). This is the core RAG guarantee, demonstrated live.
+- **Self-correction works:** on insufficient evidence the grader triggers a rewrite→retrieve loop,
+  bounded by `max_iterations`. Verified end-to-end on multi-hop questions.
+- **Multi-hop success:** on HotpotQA (avg 2 gold passages/query) the agent correctly answered chained
+  questions, e.g. *"In what year was the university where Sergei Tokarev was a professor founded?"* →
+  *"Moscow State University was founded in 1755 [4]"*, synthesizing across two documents.
+- **Honest nuance — not every "multi-hop" question needs multiple retrievals.** When a question is
+  short and its two evidence passages are semantically close, a single hybrid+rerank retrieval often
+  surfaces both, and decomposition adds cost without benefit. The agent's value shows specifically when
+  evidence is spread across distant documents. This shaped the zero-cost `_looks_simple` heuristic that
+  skips decomposition on obviously-simple questions.
+
+> Quantitative agentic-vs-single-shot comparison and RAGAS faithfulness scores: Phase 6 (in progress).
+
+---
+
+## License
+
+MIT
